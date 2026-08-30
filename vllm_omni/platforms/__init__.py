@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 import traceback
 from itertools import chain
 from typing import TYPE_CHECKING
@@ -63,7 +64,24 @@ def rocm_omni_platform_plugin() -> str | None:
 
 
 def npu_omni_platform_plugin() -> str | None:
-    """Check if NPU OmniPlatform should be activated."""
+    """Check if NPU OmniPlatform should be activated.
+
+    Selects the backend class from the stage-scoped
+    ``VLLM_OMNI_DISABLE_VLLM_ASCEND`` env var (set via the deploy YAML's
+    per-stage ``runtime.env``, typically in the ``platforms.npu.stages``
+    section):
+
+    - ``true`` → disable vllm-ascend, use the standalone torch_npu backend
+      (:class:`~vllm_omni.platforms.npu.dit_platform.DiTNPUOmniPlatform`);
+    - unset or ``false`` (default) → use the vllm-ascend backend
+      (:class:`~vllm_omni.platforms.npu.ar_platform.ARNPUOmniPlatform`; a
+      missing vllm-ascend raises from the AR class constructor with install
+      guidance). The default keeps the pre-split behavior for existing
+      vllm-ascend deployments.
+
+    NOTE: this function must never raise — ``resolve_current_omni_platform_cls_qualname``
+    swallows plugin exceptions, which would silently drop the NPU platform.
+    """
     is_npu = False
     logger.debug("Checking if NPU OmniPlatform is available.")
     try:
@@ -75,7 +93,13 @@ def npu_omni_platform_plugin() -> str | None:
     except Exception as e:
         logger.debug("NPU OmniPlatform is not available because: %s", str(e))
 
-    return "vllm_omni.platforms.npu.platform.NPUOmniPlatform" if is_npu else None
+    if not is_npu:
+        return None
+
+    flag = os.environ.get("VLLM_OMNI_DISABLE_VLLM_ASCEND", "false").strip().lower()
+    if flag == "true":
+        return "vllm_omni.platforms.npu.dit_platform.DiTNPUOmniPlatform"
+    return "vllm_omni.platforms.npu.ar_platform.ARNPUOmniPlatform"
 
 
 def xpu_omni_platform_plugin() -> str | None:

@@ -6,13 +6,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms.interface import PlatformEnum
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
-from vllm_omni.platforms.npu.standalone import StandaloneNPUPlatformMixin
 
 logger = init_logger(__name__)
 
@@ -26,9 +24,11 @@ _DIFFUSION_PACKED_MODULES_MAPPING = {
 def _vllm_ascend_available() -> bool:
     """Return True when the vllm-ascend package is importable.
 
-    vllm-ascend is an optional runtime backend for AR/generation NPU
-    stages. Pure diffusion stages never need it; this guard keeps the
-    NPU platform usable in environments without vllm-ascend installed.
+    Shared by the platform plugin (auto backend selection), the
+    ``adopt_as_vllm_platform`` hook (no-op when vllm-ascend is installed) and
+    :class:`ARNPUOmniPlatform.__init__` (fail-early guard). Kept in this
+    vllm-ascend-free module so all three call sites reuse one definition
+    without importing vllm-ascend.
     """
     from importlib.util import find_spec
 
@@ -38,43 +38,25 @@ def _vllm_ascend_available() -> bool:
         return False
 
 
-def _vllm_ascend_required() -> bool:
-    """Return True when the current stage demands the vllm-ascend backend.
+class NPUOmniPlatform(OmniPlatform):
+    """NPU platform interface shared by the DiT and AR backends.
 
-    Read from ``VLLM_OMNI_DISABLE_VLLM_ASCEND`` (set via the stage's
-    ``runtime.env``, typically in the ``platforms.npu.stages`` section):
-    "true" forces the standalone (torch_npu-only) backend, "false" requires
-    vllm-ascend, anything else (unset / "auto") prefers vllm-ascend when
-    installed and falls back to standalone.
-    """
-    import os
+    This is the common contract for both NPU platform implementations:
 
-    flag = os.environ.get("VLLM_OMNI_DISABLE_VLLM_ASCEND", "").strip().lower()
-    if flag == "true":
-        return False
-    if flag == "false":
-        if not _vllm_ascend_available():
-            raise RuntimeError(
-                "Stage requires the vllm-ascend backend (VLLM_OMNI_DISABLE_VLLM_ASCEND=false), "
-                "but vllm-ascend is not installed. Pure diffusion stages do NOT "
-                "need it; install vllm-ascend or set VLLM_OMNI_DISABLE_VLLM_ASCEND=true."
-            )
-        return True
-    return _vllm_ascend_available()
+    - :class:`DiTNPUOmniPlatform` (``vllm_omni/platforms/npu/dit_platform.py``)
+      — torch_npu-native, used by pure diffusion stages; lowest dependency.
+    - :class:`ARNPUOmniPlatform` (``vllm_omni/platforms/npu/ar_platform.py``)
+      — vllm-ascend-enhanced, used by AR/generation stages; inherits this
+      interface together with vllm-ascend's ``NPUPlatform``.
 
-
-class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
-    """NPU/Ascend implementation of OmniPlatform.
-
-    Standalone (torch_npu-native) implementation that does NOT require
-    vllm-ascend: pure diffusion stages (e.g. Qwen-Image) run with the
-    torch_npu backend + mindiesd attention alone. When vllm-ascend is
-    installed, optional Ascend enhancements are applied lazily so that
-    AR/generation stages keep their existing behavior.
-
-    ``StandaloneNPUPlatformMixin`` is listed first so its torch_npu
-    ``Platform``-interface implementations take precedence over vLLM's
-    ``Platform`` defaults (several of which raise ``NotImplementedError``).
+    Placement rule: only methods that are (a) shared by both backends with
+    identical implementations and (b) **not** defined by vllm-ascend's
+    ``NPUPlatform`` live here. Everything else lives on the concrete
+    subclasses: the torch_npu ``Platform`` entries on
+    ``DiTNPUOmniPlatform``, the vllm-ascend-provided entries inherited by
+    ``ARNPUOmniPlatform``. Keeping this rule makes the MRO of
+    ``ARNPUOmniPlatform`` conflict-free — this interface is the complement
+    of vllm-ascend's platform surface.
     """
 
     _omni_enum = OmniPlatformEnum.NPU
@@ -84,47 +66,7 @@ class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
     device_type: str = "npu"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
-    # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
-    def __init__(self) -> None:
-        from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
-
-        if _vllm_ascend_required():
-            from vllm_ascend.utils import adapt_patch
-
-            # AR/generation model patches (Qwen3-TTS, MiniCPM-o 4.5 code2wav)
-            # only make sense when the vllm-ascend backend is active; they
-            # import vllm_ascend at module scope, so skip them entirely on the
-            # standalone (no vllm-ascend) path.
-            from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
-                apply_minicpmo_4_5_code2wav_patch,
-            )
-            from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
-                apply_qwen3_tts_code2wav_patch,
-            )
-            from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
-                apply_qwen3_tts_tokenizer_v2_patch,
-            )
-
-            adapt_patch(is_global_patch=True)
-            apply_minicpmo_4_5_code2wav_patch()
-            apply_qwen3_tts_code2wav_patch()
-            apply_qwen3_tts_tokenizer_v2_patch()
-        apply_310p_patches()
-
-    @classmethod
-    def set_device(cls, device: torch.device) -> None:
-        super().set_device(device)
-
-        if _vllm_ascend_required():
-            # Register vllm_ascend custom ops (torch.ops._C_ascend.*).
-            from vllm_ascend.utils import enable_custom_op
-
-            enable_custom_op()
-
-        # Ascend quantized weights are converted from ND to FRACTAL_NZ
-        # after loading. Enable internal format so the NZ storage layout
-        # is preserved for fused NPU kernels.
-        torch.npu.config.allow_internal_format = True
+    # ── OmniPlatform interface (shared, vllm-ascend does not define these) ──
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -133,57 +75,6 @@ class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
-
-    @classmethod
-    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
-        if _vllm_ascend_required():
-            from vllm_ascend.ascend_config import init_ascend_config
-
-            init_ascend_config(vllm_config)
-
-    @classmethod
-    def get_diffusion_kv_block_tables_cls(cls) -> type:
-        from vllm_ascend.worker.v2.block_table import AscendBlockTables
-
-        return AscendBlockTables
-
-    @classmethod
-    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
-        """Build the Ascend metadata required by the native NPU backend."""
-        from vllm_ascend.attention.attention_v1 import AscendAttentionState
-        from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
-
-        kwargs = dict(kwargs)
-        seq_lens_cpu = kwargs.pop("seq_lens_cpu")
-        kwargs["seq_lens_np"] = seq_lens_cpu.detach().cpu().numpy()
-        # The diffusion adapter always supplies a paged cache and the current
-        # K/V write span. ChunkedPrefill is Ascend's cache-backed FIA state for
-        # both multi-token updates and single-token updates in this path.
-        kwargs["attn_state"] = AscendAttentionState.ChunkedPrefill
-        return build_attn_metadata(**kwargs)
-
-    @classmethod
-    def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
-        from vllm_omni.platforms.npu.models.minimax_h3 import (
-            apply_minimax_h3_qwen3vl_patch,
-            apply_minimax_h3_qwen3vl_sdpa_patch,
-            apply_minimax_h3_qwen3vl_swiglu_patch,
-        )
-
-        # These patches import the MiniMax encoder package, whose __init__ loads
-        # pipeline_minimax_h3 → diffusion.data. Doing that during platform
-        # construction races vllm_omni/__init__.py (patch before config) and
-        # closes a cycle through pipeline_registry → PI0_PIPELINE →
-        # DiffusionOutput. Apply them only after the platform exists, before
-        # the diffusion pipeline is loaded.
-        apply_minimax_h3_qwen3vl_patch()
-        apply_minimax_h3_qwen3vl_sdpa_patch()
-        apply_minimax_h3_qwen3vl_swiglu_patch()
-        if _vllm_ascend_required():
-            from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
-
-            set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
-            set_mc2_mask(vllm_config, device)
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
@@ -241,15 +132,10 @@ class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
                 )
                 backend_upper = "FLASH_ATTN"
 
-            if backend_upper in ("FLASH_ATTN", "RAINFUSION_ATTN") and find_spec("mindiesd"):
-                # Eager-import mindiesd only for backends that actually reach
-                # mindiesd kernels: FLASH_ATTN directly, and RAINFUSION_ATTN
-                # via its dense FlashAttention fallback (used before
-                # start_step and on any layer without a sparsifiable video
-                # segment). Other backends (e.g. TORCH_SDPA) never touch
-                # mindiesd, so a broken optional install must not block them.
-                # CANN snapshots the custom-op registry at the first
-                # custom-op regInfo lookup in the process (e.g. a
+            if backend_upper == "FLASH_ATTN" and find_spec("mindiesd"):
+                # The NPU FLASH_ATTN backend imports mindiesd lazily at first
+                # forward, but CANN snapshots the custom-op registry at the
+                # first custom-op regInfo lookup in the process (e.g. a
                 # vllm-ascend custom op during model load/warmup). Import
                 # mindiesd here so its env.py prepends the mindiesd vendor
                 # dirs (aie_ascendc etc.) to ASCEND_CUSTOM_OPP_PATH before
@@ -276,6 +162,24 @@ class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
     @classmethod
     def supports_torch_inductor(cls) -> bool:
         return False
+
+    @classmethod
+    def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
+        from vllm_omni.platforms.npu.models.minimax_h3 import (
+            apply_minimax_h3_qwen3vl_patch,
+            apply_minimax_h3_qwen3vl_swiglu_patch,
+        )
+
+        # Both patches import the MiniMax encoder package, whose __init__ loads
+        # pipeline_minimax_h3 → diffusion.data. Doing that during platform
+        # construction races vllm_omni/__init__.py (patch before config) and
+        # closes a cycle through pipeline_registry → PI0_PIPELINE →
+        # DiffusionOutput. Apply them only after the platform exists, before
+        # the diffusion pipeline is loaded.
+        apply_minimax_h3_qwen3vl_patch()
+        apply_minimax_h3_qwen3vl_swiglu_patch()
+
+    # ── Device helpers (shared, vllm-ascend does not define these) ─────────
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
@@ -325,15 +229,6 @@ class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
         return free, total
 
     @classmethod
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        # NOTE: vllm-ascend deliberately leaves this as NotImplementedError to
-        # avoid initializing torch_npu too early, but vLLM's engine startup
-        # (vllm/v1/worker/startup_plan.py) calls it unconditionally. Keep this
-        # torch_npu implementation so the standalone path satisfies the call.
-        device_props = torch.npu.get_device_properties(device_id)
-        return device_props.total_memory
-
-    @classmethod
     def create_autocast_context(cls, *, device_type, dtype, enabled=True):
         if device_type != "npu":
             return super().create_autocast_context(
@@ -355,61 +250,55 @@ class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
     def get_profiler_cls(cls) -> str:
         return "vllm_omni.platforms.npu.profiler.NPUTorchProfilerWrapper"
 
-    @classmethod
-    def get_graph_wrapper_cls(cls) -> type:
-        if _vllm_ascend_required():
-            from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+    # ── vLLM current_platform adoption (omni-specific hook) ────────────────
 
-            return ACLGraphWrapper
-        return super().get_graph_wrapper_cls()
+    def adopt_as_vllm_platform(self) -> None:
+        """Adopt this NPU platform as vLLM's ``current_platform``.
 
-    @classmethod
-    def set_forward_context(
-        cls,
-        attn_metadata,
-        vllm_config,
-        *,
-        cudagraph_runtime_mode,
-        batch_descriptor,
-    ):
-        if _vllm_ascend_required():
-            from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+        vLLM 0.26 has no built-in NPU platform; without vllm-ascend its
+        ``current_platform`` stays ``UnspecifiedPlatform``, and every
+        ``from vllm.platforms import current_platform`` binds that object at
+        import time (e.g. in ``vllm.utils.mem_utils``). We deliberately do
+        NOT register a ``vllm.platform_plugins`` entry point (loading
+        vllm_omni during vLLM's early plugin phase creates a circular import
+        through ``vllm_omni.patch → vllm.config``). Instead, once the Omni
+        platform is resolved, adopt it here so vLLM-side consumers (e.g.
+        ``DeviceMemoryProfiler`` in diffusion worker subprocesses) see a real
+        NPU platform. When vllm-ascend is installed vLLM already resolves its
+        own NPUPlatform and this is a no-op.
+        """
+        if _vllm_ascend_available():
+            return
+        try:
+            import vllm.platforms as vllm_platforms
 
-            return set_ascend_forward_context(
-                attn_metadata,
-                vllm_config,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
-            )
-        return super().set_forward_context(
-            attn_metadata,
-            vllm_config,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            batch_descriptor=batch_descriptor,
-        )
+            if vllm_platforms.current_platform.is_unspecified():
+                vllm_platforms.current_platform = self
+                logger.debug(
+                    "Adopted Omni platform as vLLM current_platform: %s",
+                    type(self).__name__,
+                )
+                _rebind_vllm_platform_refs(self)
+        except Exception:
+            logger.debug("Failed to sync vLLM current_platform", exc_info=True)
 
-    @classmethod
-    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        if _vllm_ascend_required():
-            from vllm_ascend.ascend_config import init_ascend_config
-            from vllm_ascend.logger import configure_ascend_file_logging, configure_ascend_logging
 
-            init_ascend_config(vllm_config)
-            configure_ascend_file_logging()
-            configure_ascend_logging()
+def _rebind_vllm_platform_refs(platform) -> None:
+    """Point already-imported vllm modules at the resolved Omni platform.
 
-    @classmethod
-    def import_kernels(cls) -> None:
-        if _vllm_ascend_required():
-            # Delegate to vllm-ascend's lazy bootstrap (sets
-            # ASCEND_CUSTOM_OPP_PATH with a one-shot guard), matching the
-            # original framework behavior.
-            from vllm_ascend.platform import NPUPlatform
+    vLLM 0.26 modules do ``from vllm.platforms import current_platform`` at
+    import time, capturing whatever was resolved then. In worker subprocesses
+    without vllm-ascend that is UnspecifiedPlatform; re-bind the captured
+    references so vLLM-side helpers (DeviceMemoryProfiler, etc.) use the Omni
+    NPU platform.
+    """
+    import sys
 
-            NPUPlatform.import_kernels()
-
-    @classmethod
-    def support_static_graph_mode(cls) -> bool:
-        # vllm-ascend's NPUPlatform supports static graph mode; the standalone
-        # torch_npu path does not.
-        return _vllm_ascend_required()
+    module = sys.modules.get("vllm.utils.mem_utils")
+    if module is None or not hasattr(module, "current_platform"):
+        return
+    bound = module.current_platform
+    if bound is platform or getattr(bound, "device_type", "") != "":
+        return
+    module.current_platform = platform
+    logger.debug("Re-bound %s.current_platform to %s", "vllm.utils.mem_utils", type(platform).__name__)

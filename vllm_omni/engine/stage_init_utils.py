@@ -598,6 +598,20 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
 
     _apply_rocm_attention_backend(engine_args, stage_type)
 
+    # NPU backend scope pre-check: AR/generation stages require vllm-ascend,
+    # pure diffusion stages do not. Fail early with a clear message instead of
+    # waiting for worker instantiation.
+    if stage_type != "diffusion" and current_omni_platform.is_npu():
+        from importlib.util import find_spec
+
+        if find_spec("vllm_ascend") is None:
+            raise RuntimeError(
+                f"Stage {stage_id} is an llm (AR/generation) stage, which "
+                "requires vllm-ascend on NPU. Pure diffusion stages do NOT "
+                "need it. Install vllm-ascend, or declare this stage as a "
+                "diffusion stage."
+            )
+
     runtime_cfg = stage_config.runtime
     engine_input_source: list[int] = _get_attr_or_item(stage_config, "engine_input_source", [])
     final_output: bool = stage_config.final_output

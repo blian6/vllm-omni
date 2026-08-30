@@ -20,7 +20,16 @@ from vllm.logger import init_logger
 from vllm_omni.platforms import current_omni_platform
 
 if current_omni_platform.is_npu():
-    from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding as _BaseMRotaryEmbedding
+    from importlib.util import find_spec
+
+    if find_spec("vllm_ascend") is None:
+        # Standalone NPU (no vllm-ascend): fall back to the upstream vLLM
+        # MRotaryEmbedding. OmniMRotaryEmbedding is only exercised on the
+        # AR/multimodal-LLM path, which requires vllm-ascend anyway; the
+        # upstream base keeps module imports alive for pure diffusion stages.
+        from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding as _BaseMRotaryEmbedding
+    else:
+        from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding as _BaseMRotaryEmbedding
 else:
     from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding as _BaseMRotaryEmbedding
 

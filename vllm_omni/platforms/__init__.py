@@ -180,6 +180,11 @@ def __getattr__(name: str):
             _current_omni_platform = resolve_obj_by_qualname(platform_cls_qualname)()
             global _init_trace
             _init_trace = "".join(traceback.format_stack())
+            # Platforms may adopt themselves as vLLM's current_platform (e.g.
+            # NPU without vllm-ascend); the hook is optional per platform.
+            adopt = getattr(_current_omni_platform, "adopt_as_vllm_platform", None)
+            if callable(adopt):
+                adopt()
         return _current_omni_platform
     elif name in globals():
         return globals()[name]

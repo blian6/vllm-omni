@@ -6,11 +6,13 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm_ascend.platform import NPUPlatform
+from vllm.platforms.interface import PlatformEnum
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.npu.standalone import StandaloneNPUPlatformMixin
 
 logger = init_logger(__name__)
 
@@ -21,45 +23,103 @@ _DIFFUSION_PACKED_MODULES_MAPPING = {
 }
 
 
-class NPUOmniPlatform(OmniPlatform, NPUPlatform):
+def _vllm_ascend_available() -> bool:
+    """Return True when the vllm-ascend package is importable.
+
+    vllm-ascend is an optional runtime backend for AR/generation NPU
+    stages. Pure diffusion stages never need it; this guard keeps the
+    NPU platform usable in environments without vllm-ascend installed.
+    """
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("vllm_ascend") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _vllm_ascend_required() -> bool:
+    """Return True when the current stage demands the vllm-ascend backend.
+
+    Read from ``VLLM_OMNI_DISABLE_VLLM_ASCEND`` (set via the stage's
+    ``runtime.env``, typically in the ``platforms.npu.stages`` section):
+    "true" forces the standalone (torch_npu-only) backend, "false" requires
+    vllm-ascend, anything else (unset / "auto") prefers vllm-ascend when
+    installed and falls back to standalone.
+    """
+    import os
+
+    flag = os.environ.get("VLLM_OMNI_DISABLE_VLLM_ASCEND", "").strip().lower()
+    if flag == "true":
+        return False
+    if flag == "false":
+        if not _vllm_ascend_available():
+            raise RuntimeError(
+                "Stage requires the vllm-ascend backend (VLLM_OMNI_DISABLE_VLLM_ASCEND=false), "
+                "but vllm-ascend is not installed. Pure diffusion stages do NOT "
+                "need it; install vllm-ascend or set VLLM_OMNI_DISABLE_VLLM_ASCEND=true."
+            )
+        return True
+    return _vllm_ascend_available()
+
+
+class NPUOmniPlatform(StandaloneNPUPlatformMixin, OmniPlatform):
     """NPU/Ascend implementation of OmniPlatform.
 
-    Inherits all NPU-specific implementations from vllm-ascend's NPUPlatform,
-    and adds Omni-specific interfaces from OmniPlatform.
+    Standalone (torch_npu-native) implementation that does NOT require
+    vllm-ascend: pure diffusion stages (e.g. Qwen-Image) run with the
+    torch_npu backend + mindiesd attention alone. When vllm-ascend is
+    installed, optional Ascend enhancements are applied lazily so that
+    AR/generation stages keep their existing behavior.
+
+    ``StandaloneNPUPlatformMixin`` is listed first so its torch_npu
+    ``Platform``-interface implementations take precedence over vLLM's
+    ``Platform`` defaults (several of which raise ``NotImplementedError``).
     """
 
     _omni_enum = OmniPlatformEnum.NPU
+    _enum = PlatformEnum.OOT
     dist_backend: str = "hccl"
+    device_name: str = "npu"
+    device_type: str = "npu"
+    device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
     def __init__(self) -> None:
-        from vllm_ascend.utils import adapt_patch
-
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
-        from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
-            apply_minicpmo_4_5_code2wav_patch,
-        )
-        from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
-            apply_qwen3_tts_code2wav_patch,
-        )
-        from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
-            apply_qwen3_tts_tokenizer_v2_patch,
-        )
 
-        adapt_patch(is_global_patch=True)
-        apply_minicpmo_4_5_code2wav_patch()
-        apply_qwen3_tts_code2wav_patch()
-        apply_qwen3_tts_tokenizer_v2_patch()
+        if _vllm_ascend_required():
+            from vllm_ascend.utils import adapt_patch
+
+            # AR/generation model patches (Qwen3-TTS, MiniCPM-o 4.5 code2wav)
+            # only make sense when the vllm-ascend backend is active; they
+            # import vllm_ascend at module scope, so skip them entirely on the
+            # standalone (no vllm-ascend) path.
+            from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+                apply_minicpmo_4_5_code2wav_patch,
+            )
+            from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
+                apply_qwen3_tts_code2wav_patch,
+            )
+            from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
+                apply_qwen3_tts_tokenizer_v2_patch,
+            )
+
+            adapt_patch(is_global_patch=True)
+            apply_minicpmo_4_5_code2wav_patch()
+            apply_qwen3_tts_code2wav_patch()
+            apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         super().set_device(device)
 
-        # Register vllm_ascend custom ops (torch.ops._C_ascend.*).
-        from vllm_ascend.utils import enable_custom_op
+        if _vllm_ascend_required():
+            # Register vllm_ascend custom ops (torch.ops._C_ascend.*).
+            from vllm_ascend.utils import enable_custom_op
 
-        enable_custom_op()
+            enable_custom_op()
 
         # Ascend quantized weights are converted from ND to FRACTAL_NZ
         # after loading. Enable internal format so the NZ storage layout
@@ -76,9 +136,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
-        from vllm_ascend.ascend_config import init_ascend_config
+        if _vllm_ascend_required():
+            from vllm_ascend.ascend_config import init_ascend_config
 
-        init_ascend_config(vllm_config)
+            init_ascend_config(vllm_config)
 
     @classmethod
     def get_diffusion_kv_block_tables_cls(cls) -> type:
@@ -103,8 +164,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
-        from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
-
         from vllm_omni.platforms.npu.models.minimax_h3 import (
             apply_minimax_h3_qwen3vl_patch,
             apply_minimax_h3_qwen3vl_sdpa_patch,
@@ -120,8 +179,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         apply_minimax_h3_qwen3vl_patch()
         apply_minimax_h3_qwen3vl_sdpa_patch()
         apply_minimax_h3_qwen3vl_swiglu_patch()
-        set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
-        set_mc2_mask(vllm_config, device)
+        if _vllm_ascend_required():
+            from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
+
+            set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
+            set_mc2_mask(vllm_config, device)
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
@@ -264,6 +326,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
+        # NOTE: vllm-ascend deliberately leaves this as NotImplementedError to
+        # avoid initializing torch_npu too early, but vLLM's engine startup
+        # (vllm/v1/worker/startup_plan.py) calls it unconditionally. Keep this
+        # torch_npu implementation so the standalone path satisfies the call.
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
 
@@ -291,9 +357,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_graph_wrapper_cls(cls) -> type:
-        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+        if _vllm_ascend_required():
+            from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 
-        return ACLGraphWrapper
+            return ACLGraphWrapper
+        return super().get_graph_wrapper_cls()
 
     @classmethod
     def set_forward_context(
@@ -304,11 +372,44 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         cudagraph_runtime_mode,
         batch_descriptor,
     ):
-        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+        if _vllm_ascend_required():
+            from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 
-        return set_ascend_forward_context(
+            return set_ascend_forward_context(
+                attn_metadata,
+                vllm_config,
+                aclgraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+            )
+        return super().set_forward_context(
             attn_metadata,
             vllm_config,
-            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
             batch_descriptor=batch_descriptor,
         )
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if _vllm_ascend_required():
+            from vllm_ascend.ascend_config import init_ascend_config
+            from vllm_ascend.logger import configure_ascend_file_logging, configure_ascend_logging
+
+            init_ascend_config(vllm_config)
+            configure_ascend_file_logging()
+            configure_ascend_logging()
+
+    @classmethod
+    def import_kernels(cls) -> None:
+        if _vllm_ascend_required():
+            # Delegate to vllm-ascend's lazy bootstrap (sets
+            # ASCEND_CUSTOM_OPP_PATH with a one-shot guard), matching the
+            # original framework behavior.
+            from vllm_ascend.platform import NPUPlatform
+
+            NPUPlatform.import_kernels()
+
+    @classmethod
+    def support_static_graph_mode(cls) -> bool:
+        # vllm-ascend's NPUPlatform supports static graph mode; the standalone
+        # torch_npu path does not.
+        return _vllm_ascend_required()

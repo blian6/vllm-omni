@@ -10,6 +10,8 @@ mindiesd attention and never need vllm-ascend; this module stays free of any
 without vllm-ascend.
 """
 
+from typing import Any
+
 import torch
 from vllm.logger import init_logger
 
@@ -86,3 +88,21 @@ class DiTNPUOmniPlatform(NPUOmniPlatform):
         # torch_npu implementation so the standalone path satisfies the call.
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
+
+    @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        raise NotImplementedError(
+            "DiTNPUOmniPlatform (standalone torch_npu) does not implement the "
+            "native diffusion paged-KV path. Use ARNPUOmniPlatform "
+            "(vllm-ascend) for models that enable diffusion_kv, or set "
+            "VLLM_OMNI_DISABLE_VLLM_ASCEND=false."
+        )
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        raise NotImplementedError(
+            "DiTNPUOmniPlatform (standalone torch_npu) does not implement the "
+            "native diffusion paged-KV path. Use ARNPUOmniPlatform "
+            "(vllm-ascend) for models that enable diffusion_kv, or set "
+            "VLLM_OMNI_DISABLE_VLLM_ASCEND=false."
+        )

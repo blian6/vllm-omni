@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from typing import Any
@@ -132,10 +132,15 @@ class NPUOmniPlatform(OmniPlatform):
                 )
                 backend_upper = "FLASH_ATTN"
 
-            if backend_upper == "FLASH_ATTN" and find_spec("mindiesd"):
-                # The NPU FLASH_ATTN backend imports mindiesd lazily at first
-                # forward, but CANN snapshots the custom-op registry at the
-                # first custom-op regInfo lookup in the process (e.g. a
+            if backend_upper in ("FLASH_ATTN", "RAINFUSION_ATTN") and find_spec("mindiesd"):
+                # Eager-import mindiesd only for backends that actually reach
+                # mindiesd kernels: FLASH_ATTN directly, and RAINFUSION_ATTN
+                # via its dense FlashAttention fallback (used before
+                # start_step and on any layer without a sparsifiable video
+                # segment). Other backends (e.g. TORCH_SDPA) never touch
+                # mindiesd, so a broken optional install must not block them.
+                # CANN snapshots the custom-op registry at the first
+                # custom-op regInfo lookup in the process (e.g. a
                 # vllm-ascend custom op during model load/warmup). Import
                 # mindiesd here so its env.py prepends the mindiesd vendor
                 # dirs (aie_ascendc etc.) to ASCEND_CUSTOM_OPP_PATH before
@@ -160,6 +165,14 @@ class NPUOmniPlatform(OmniPlatform):
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Return whether MindIE-SD is installed for dense NPU FlashAttention."""
+
+        from importlib.util import find_spec
+
+        return find_spec("mindiesd") is not None
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         return False
 
@@ -167,16 +180,18 @@ class NPUOmniPlatform(OmniPlatform):
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_omni.platforms.npu.models.minimax_h3 import (
             apply_minimax_h3_qwen3vl_patch,
+            apply_minimax_h3_qwen3vl_sdpa_patch,
             apply_minimax_h3_qwen3vl_swiglu_patch,
         )
 
-        # Both patches import the MiniMax encoder package, whose __init__ loads
+        # These patches import the MiniMax encoder package, whose __init__ loads
         # pipeline_minimax_h3 → diffusion.data. Doing that during platform
         # construction races vllm_omni/__init__.py (patch before config) and
         # closes a cycle through pipeline_registry → PI0_PIPELINE →
         # DiffusionOutput. Apply them only after the platform exists, before
         # the diffusion pipeline is loaded.
         apply_minimax_h3_qwen3vl_patch()
+        apply_minimax_h3_qwen3vl_sdpa_patch()
         apply_minimax_h3_qwen3vl_swiglu_patch()
 
     # ── Device helpers (shared, vllm-ascend does not define these) ─────────
@@ -211,7 +226,12 @@ class NPUOmniPlatform(OmniPlatform):
         """
         try:
             torch.npu.current_stream().synchronize()
-            event = torch.npu.Event()
+            # The async output worker uses the public ``torch.Stream`` API.
+            # With torch_npu 2.10, a native ``torch.npu.Event`` cannot be
+            # consumed by that wrapper stream (the reverse direction is
+            # supported), while ``torch.Event`` is dispatched to the active
+            # NPU backend and remains cross-stream compatible.
+            event = torch.Event()
             event.record()
             return event
         except Exception:

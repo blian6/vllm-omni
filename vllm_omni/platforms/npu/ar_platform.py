@@ -10,6 +10,7 @@ false), so the module-level ``vllm_ascend`` import is safe: it is only
 reached when the vllm-ascend backend is actually required.
 """
 
+from functools import cache
 from typing import Any
 
 import torch
@@ -21,6 +22,28 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_omni.platforms.npu.platform import NPUOmniPlatform, _vllm_ascend_available
 
 logger = init_logger(__name__)
+
+
+@cache
+def _get_strict_ulysses_paged_backend() -> type:
+    """Return an Ascend backend that bypasses vLLM PCP dispatch."""
+
+    from vllm_ascend.attention.attention_v1 import (
+        AscendAttentionBackend,
+        AscendAttentionBackendImpl,
+        AscendAttentionMetadataBuilder,
+    )
+
+    class AscendStrictUlyssesPagedBackend(AscendAttentionBackend):
+        @staticmethod
+        def get_impl_cls() -> type:
+            return AscendAttentionBackendImpl
+
+        @staticmethod
+        def get_builder_cls() -> type:
+            return AscendAttentionMetadataBuilder
+
+    return AscendStrictUlyssesPagedBackend
 
 
 class ARNPUOmniPlatform(NPUOmniPlatform, NPUPlatform):
@@ -83,8 +106,75 @@ class ARNPUOmniPlatform(NPUOmniPlatform, NPUPlatform):
     @classmethod
     def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
         from vllm_ascend.ascend_config import init_ascend_config
+        from vllm_ascend.utils import adapt_patch
 
+        # Omni's custom DiffusionWorker does not pass through vLLM-Ascend's
+        # NPUWorker constructor, where worker-local patches are normally
+        # installed.  In particular, AscendBlockTables needs the patched
+        # non-UVA buffer implementation on NPU.
+        adapt_patch()
         init_ascend_config(vllm_config)
+
+    @classmethod
+    def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
+        """Use the block geometry required by Ascend's native paged kernel."""
+        if getattr(od_config, "diffusion_kv_mode", None) is None:
+            return
+        from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+
+        if od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        supported_sizes = [
+            size for size in AscendAttentionBackend.get_supported_kernel_block_sizes() if type(size) is int and size > 0
+        ]
+        if not supported_sizes:
+            raise RuntimeError("Ascend paged attention did not expose an integer kernel block size")
+        # vLLM's generic default is 16, while the Ascend FIA backend stores
+        # cache pages as 128-token blocks. Set the Manager geometry
+        # before KV specs are collected so Scheduler and Worker agree.
+        vllm_config.cache_config.block_size = supported_sizes[0]
+
+    @classmethod
+    def requires_diffusion_paged_kv_prewrite(cls) -> bool:
+        """Write the full K/V span once before piecewise FIA segments."""
+
+        return True
+
+    @classmethod
+    def get_diffusion_paged_kv_attn_backend(cls, attn_backend: type, *, ulysses_degree: int) -> type:
+        """Keep strict Ulysses paged FIA out of vLLM's PCP implementation."""
+
+        del cls
+        if ulysses_degree <= 1:
+            return attn_backend
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        if not isinstance(attn_backend, type) or not issubclass(attn_backend, AscendAttentionBackend):
+            return attn_backend
+        return _get_strict_ulysses_paged_backend()
+
+    @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        from vllm_ascend.worker.v2.block_table import AscendBlockTables
+
+        return AscendBlockTables
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        """Build the Ascend metadata required by the native NPU backend."""
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+        from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+
+        kwargs = dict(kwargs)
+        seq_lens_cpu = kwargs.pop("seq_lens_cpu")
+        kwargs["seq_lens_np"] = seq_lens_cpu.detach().cpu().numpy()
+        # The diffusion adapter always supplies a paged cache and the current
+        # K/V write span. ChunkedPrefill is Ascend's cache-backed FIA state for
+        # both multi-token updates and single-token updates in this path.
+        kwargs["attn_state"] = AscendAttentionState.ChunkedPrefill
+        return build_attn_metadata(**kwargs)
 
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
